@@ -1,0 +1,166 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Main AegisAI API Service
+  aegis-api:
+    build: 
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "5000:5000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_HOST=redis
+      - POSTGRES_HOST=postgres
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - aegis-network
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+
+  # GNN Inference Service (GPU-enabled)
+  gnn-inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.gnn
+    runtime: nvidia  # For GPU support
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    ports:
+      - "5001:5001"
+    networks:
+      - aegis-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - aegis-network
+    volumes:
+      - redis-data:/data
+
+  # PostgreSQL for threat intelligence storage
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=aegis_db
+      - POSTGRES_USER=aegis_user
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    networks:
+      - aegis-network
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  # Nginx for load balancing
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - aegis-api
+    networks:
+      - aegis-network
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - aegis-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - aegis-network
+
+networks:
+  aegis-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+
+---
+# Dockerfile.api
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+COPY gnn_risk_engine.py .
+COPY multi_risk_gnn.pt .
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import requests; requests.get('http://localhost:5000/health')" || exit 1
+
+EXPOSE 5000
+
+CMD ["gunicorn", "--workers=4", "--bind=0.0.0.0:5000", "--timeout=120", "app:app"]
+
+---
+# Dockerfile.gnn
+FROM pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime
+
+WORKDIR /app
+
+# Install additional packages
+RUN pip install --no-cache-dir \
+    torch-geometric \
+    flask \
+    gunicorn \
+    numpy \
+    scipy
+
+# Copy

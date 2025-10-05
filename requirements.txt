@@ -1,0 +1,10 @@
+torch
+torchvision
+torchaudio
+torch_geometric
+numpy
+scikit-learn
+flask
+flask-cors
+requests
+scipy
